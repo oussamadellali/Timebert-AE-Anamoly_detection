@@ -1,0 +1,348 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, confusion_matrix, roc_curve, auc
+from imblearn.over_sampling import ADASYN
+from sklearn.model_selection import train_test_split
+import os
+
+# ---------- Device ----------
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ---------- Positional Encoding ----------
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-np.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.pe = pe.unsqueeze(0)
+
+    def forward(self, x):
+        return x + self.pe[:, :x.size(1)].to(x.device)
+
+# ---------- Modules ----------
+class TimeBERTEncoder(nn.Module):
+    def __init__(self, input_dim, d_model=64, nhead=4, num_layers=3):
+        super().__init__()
+        self.input_proj = nn.Linear(input_dim, d_model)
+        self.pos_encoder = PositionalEncoding(d_model)
+        encoder_layer = nn.TransformerEncoderLayer(d_model, nhead)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers)
+
+    def forward(self, x):
+        x = self.input_proj(x)
+        x = self.pos_encoder(x)
+        return self.transformer(x)
+
+class MaskedDecoder(nn.Module):
+    def __init__(self, d_model, output_dim):
+        super().__init__()
+        self.output_proj = nn.Linear(d_model, output_dim)
+
+    def forward(self, x):
+        return self.output_proj(x)
+
+class ForecastDecoder(nn.Module):
+    def __init__(self, d_model, output_dim):
+        super().__init__()
+        self.rnn = nn.GRU(d_model, d_model, batch_first=True)
+        self.output_proj = nn.Linear(d_model, output_dim)
+
+    def forward(self, x):
+        x, _ = self.rnn(x)
+        return self.output_proj(x)
+
+class ClassifierHead(nn.Module):
+    def __init__(self, d_model):
+        super().__init__()
+        self.classifier = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+            nn.Linear(d_model, 64),
+            nn.ReLU(),
+            nn.Linear(64, 2)
+        )
+
+    def forward(self, x):
+        x = x.transpose(1, 2)
+        return self.classifier(x)
+
+class HybridTimeBERTAE(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        self.encoder = TimeBERTEncoder(input_dim)
+        self.masked_decoder = MaskedDecoder(64, input_dim)
+        self.forecast_decoder = ForecastDecoder(64, input_dim)
+        self.classifier_head = ClassifierHead(64)
+
+    def forward(self, x, mask):
+        encoded = self.encoder(x)
+        masked_recon = self.masked_decoder(encoded)
+        forecasted = self.forecast_decoder(encoded)
+        classification = self.classifier_head(encoded)
+        return masked_recon, forecasted, classification
+
+def hybrid_loss(x, masked_recon, forecasted, mask, class_logits=None, class_labels=None, alpha=0.3):
+    masked_loss = F.mse_loss(masked_recon[mask], x[mask])
+    forecast_loss = F.mse_loss(forecasted, x)
+    total_loss = masked_loss + forecast_loss
+    if class_logits is not None and class_labels is not None:
+        classification_loss = F.cross_entropy(class_logits, class_labels)
+        total_loss += alpha * classification_loss
+    return total_loss
+
+# ---------- NYC Taxi Dataset Loader ----------
+def load_nyc_taxi(filepath, seq_len=72):
+    df = pd.read_csv(filepath, parse_dates=['timestamp'])
+    anomaly_ranges = [
+        ('2014-07-04 00:00:00', '2014-07-04 23:59:59'),
+        ('2014-08-25 00:00:00', '2014-08-25 23:59:59'),
+        ('2014-12-31 00:00:00', '2014-12-31 23:59:59')
+    ]
+    df['anomaly'] = 0
+    for start, end in anomaly_ranges:
+        df.loc[(df['timestamp'] >= start) & (df['timestamp'] <= end), 'anomaly'] = 1
+
+    scaler = StandardScaler()
+    df['value'] = scaler.fit_transform(df[['value']])
+
+    X, y, timestamps = [], [], []
+    for i in range(len(df) - seq_len):
+        window = df.iloc[i:i + seq_len]
+        label = int(window['anomaly'].any())
+        X.append(window['value'].values)
+        y.append(label)
+        timestamps.append(window['timestamp'].values)
+
+    X = np.array(X)[..., None]
+    y = np.array(y)
+    timestamps = np.array(timestamps)
+
+    X_flat = X.reshape((X.shape[0], -1))
+    X_resampled, y_resampled = ADASYN().fit_resample(X_flat, y)
+    sample_indices = np.linspace(0, len(timestamps) - 1, num=len(X_resampled), dtype=int)
+    resampled_timestamps = timestamps[sample_indices]
+    X_resampled = X_resampled.reshape((-1, seq_len, 1))
+    mask = np.random.rand(*X_resampled.shape) > 0.2
+
+    dataset = TensorDataset(torch.tensor(X_resampled, dtype=torch.float32),
+                            torch.tensor(y_resampled, dtype=torch.long),
+                            torch.tensor(mask, dtype=torch.bool))
+    return dataset, scaler, resampled_timestamps
+
+# ---------- Load NYC Taxi Dataset ----------
+dataset_path = 'C:/Users/Dhia/Desktop/NAB-1.1/data/realKnownCause/nyc_taxi.csv'
+dataset, scaler, timestamps = load_nyc_taxi(dataset_path)
+
+train_idx, val_idx = train_test_split(np.arange(len(dataset)), test_size=0.2, stratify=dataset.tensors[1])
+train_set = torch.utils.data.Subset(dataset, train_idx)
+val_set = torch.utils.data.Subset(dataset, val_idx)
+train_loader = DataLoader(train_set, batch_size=32, shuffle=True)
+val_loader = DataLoader(val_set, batch_size=32)
+
+input_dim = dataset[0][0].shape[-1]
+model = HybridTimeBERTAE(input_dim).to(DEVICE)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+train_metrics, val_metrics = [], []
+
+for epoch in range(1, 101):
+    model.train()
+    train_loss = 0
+    train_preds, train_labels = [], []
+    for xb, yb, mb in train_loader:
+        xb, yb, mb = xb.to(DEVICE), yb.to(DEVICE), mb.to(DEVICE)
+        optimizer.zero_grad()
+        masked_recon, forecasted, logits = model(xb, mb)
+        loss = hybrid_loss(xb, masked_recon, forecasted, mb, logits, yb)
+        loss.backward()
+        optimizer.step()
+        train_loss += loss.item()
+        train_preds.extend(torch.argmax(logits, dim=1).cpu().numpy())
+        train_labels.extend(yb.cpu().numpy())
+    train_acc = accuracy_score(train_labels, train_preds)
+    train_f1 = f1_score(train_labels, train_preds)
+    train_prec = precision_score(train_labels, train_preds)
+    train_rec = recall_score(train_labels, train_preds)
+    train_metrics.append((train_loss, train_acc, train_f1, train_prec, train_rec))
+
+    model.eval()
+    val_loss = 0
+    val_preds, val_labels = [], []
+    with torch.no_grad():
+        for xb, yb, mb in val_loader:
+            xb, yb, mb = xb.to(DEVICE), yb.to(DEVICE), mb.to(DEVICE)
+            masked_recon, forecasted, logits = model(xb, mb)
+            loss = hybrid_loss(xb, masked_recon, forecasted, mb, logits, yb)
+            val_loss += loss.item()
+            val_preds.extend(torch.argmax(logits, dim=1).cpu().numpy())
+            val_labels.extend(yb.cpu().numpy())
+    val_acc = accuracy_score(val_labels, val_preds)
+    val_f1 = f1_score(val_labels, val_preds)
+    val_prec = precision_score(val_labels, val_preds)
+    val_rec = recall_score(val_labels, val_preds)
+    val_metrics.append((val_loss, val_acc, val_f1, val_prec, val_rec))
+
+    
+
+
+    print(f"Epoch {epoch}: "
+      f"Train Loss={train_loss:.4f}, Acc={train_acc:.4f}, F1={train_f1:.4f}, Precision={train_prec:.4f}, Recall={train_rec:.4f} | "
+      f"Val Loss={val_loss:.4f}, Acc={val_acc:.4f}, F1={val_f1:.4f}, Precision={val_prec:.4f}, Recall={val_rec:.4f}")
+
+
+# ---------- Plot Training/Validation Metrics ----------
+train_loss, train_acc, train_f1, train_prec, train_rec = zip(*train_metrics)
+val_loss, val_acc, val_f1, val_prec, val_rec = zip(*val_metrics)
+epochs = np.arange(1, len(train_loss) + 1)
+
+plt.figure(figsize=(8, 4))
+plt.plot(epochs, train_loss, label="Train Loss", marker='o')
+plt.plot(epochs, val_loss, label="Val Loss", marker='x')
+plt.title("Loss per Epoch")
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+for metric_name, train_vals, val_vals in zip([
+    "Accuracy", "F1 Score", "Precision", "Recall"],
+    [train_acc, train_f1, train_prec, train_rec],
+    [val_acc, val_f1, val_prec, val_rec]):
+    plt.figure(figsize=(8, 4))
+    plt.plot(epochs, train_vals, label=f"Train {metric_name}", marker='o')
+    plt.plot(epochs, val_vals, label=f"Val {metric_name}", marker='x')
+    plt.title(f"{metric_name} per Epoch")
+    plt.xlabel("Epoch")
+    plt.ylabel(metric_name)
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+# ------------------- FINAL EVALUATION AND VISUALIZATION -------------------
+sns.set_style("whitegrid")
+
+# Inference on full dataset
+model.eval()
+all_preds = []
+with torch.no_grad():
+    for xb, _, mb in DataLoader(dataset, batch_size=32):
+        xb, mb = xb.to(DEVICE), mb.to(DEVICE)
+        _, _, logits = model(xb, mb)
+        preds = torch.argmax(logits, dim=1).cpu().numpy()
+        all_preds.extend(preds)
+
+# Extract metrics
+y_true = dataset.tensors[1].numpy()
+y_pred = np.array(all_preds)
+conf_matrix = confusion_matrix(y_true, y_pred)
+fpr, tpr, _ = roc_curve(y_true, y_pred)
+roc_auc = auc(fpr, tpr)
+
+results = {
+    "y_true": y_true,
+    "y_pred": y_pred,
+    "timestamps": timestamps,
+    "metrics": {
+        "accuracy": accuracy_score(y_true, y_pred),
+        "f1": f1_score(y_true, y_pred),
+        "precision": precision_score(y_true, y_pred),
+        "recall": recall_score(y_true, y_pred),
+        "roc_auc": roc_auc
+    },
+    "conf_matrix": conf_matrix,
+    "fpr": fpr,
+    "tpr": tpr
+}
+
+# --- Plot 1: Confusion Matrix ---
+plt.figure(figsize=(6, 5))
+sns.heatmap(conf_matrix, annot=True, fmt='d', cmap='Blues', xticklabels=['Normal', 'Anomaly'], yticklabels=['Normal', 'Anomaly'])
+plt.title("Confusion Matrix")
+plt.xlabel("Predicted")
+plt.ylabel("True")
+plt.tight_layout()
+plt.show()
+
+# --- Plot 2: ROC Curve ---
+plt.figure(figsize=(6, 5))
+plt.plot(fpr, tpr, label=f"ROC AUC = {roc_auc:.2f}")
+plt.plot([0, 1], [0, 1], linestyle='--')
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate")
+plt.title("ROC Curve")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# --- Plot 3: Detected Anomalies on Series ---
+timestamps_flat = [ts[-1] for ts in timestamps]
+values_flat = [seq[-1][0] for seq in dataset.tensors[0]]
+anomaly_times = [ts for ts, p in zip(timestamps_flat, y_pred) if p == 1]
+anomaly_vals = [val for val, p in zip(values_flat, y_pred) if p == 1]
+
+plt.figure(figsize=(14, 5))
+plt.plot(timestamps_flat, values_flat, label='TAXI Demand)', color='blue')
+plt.scatter(anomaly_times, anomaly_vals, color='red', label='Detected Anomalies', s=30, marker='x')
+plt.title("Detected Anomalies on TAXI Demand", fontsize=14, fontweight='bold')
+plt.xlabel("Timestamp", fontsize=12)
+plt.ylabel("Normalized CPU Value", fontsize=12)
+plt.xticks(rotation=45)
+plt.legend()
+plt.grid(True, linestyle='--', alpha=0.5)
+plt.tight_layout()
+plt.show()
+
+# --- Plot 4: Flattened Per-Timestep Predictions ---
+flattened_timestamps, flattened_values, flattened_preds = [], [], []
+window_data = dataset[:][0].numpy().squeeze(-1)
+window_preds = results['y_pred']
+window_timestamps = results['timestamps']
+
+for i in range(len(window_data)):
+    for j in range(window_data.shape[1]):
+        flattened_timestamps.append(window_timestamps[i][j])
+        flattened_values.append(window_data[i][j])
+        flattened_preds.append(window_preds[i])
+
+timeline_df = pd.DataFrame({
+    "timestamp": pd.to_datetime(flattened_timestamps),
+    "value": flattened_values,
+    "pred": flattened_preds
+}).drop_duplicates(subset="timestamp").sort_values("timestamp")
+
+plt.figure(figsize=(14, 6))
+normal = timeline_df[timeline_df['pred'] == 0]
+anomaly = timeline_df[timeline_df['pred'] == 1]
+plt.plot(normal['timestamp'], normal['value'], color='blue', linewidth=0.5, label='Normal')
+plt.plot(anomaly['timestamp'], anomaly['value'], color='red', linewidth=0.5, label='Anomaly')
+plt.title("Anomaly Detection - NYC TAXI Demand")
+plt.xlabel("Timestamp")
+plt.ylabel("Scaled Value")
+plt.legend()
+plt.tight_layout()
+plt.grid(True)
+plt.show()
+
+# --- Plot 5: Barplot of Final Metrics ---
+plt.figure(figsize=(6, 4))
+metric_names = ['accuracy', 'f1', 'precision', 'recall', 'roc_auc']
+metric_values = [results['metrics'][k] for k in metric_names]
+sns.barplot(x=[k.upper() for k in metric_names], y=metric_values, palette='viridis')
+plt.ylim(0, 1)
+plt.title("Model Performance Metrics")
+plt.ylabel("Score")
+plt.tight_layout()
+plt.show()
